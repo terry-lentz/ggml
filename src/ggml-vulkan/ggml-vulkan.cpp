@@ -6049,7 +6049,12 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) {
         return ctx->device->pipeline_matmul_bf16;
     }
-    if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
+    // Intel Gen12 iGPUs: fp16 accumulation causes ~1% error per matmul that compounds
+    // across layers, and can overflow at large K values. Force f32 accumulation on Intel.
+    const bool allow_f16acc = prec == GGML_PREC_DEFAULT && ctx->device->fp16
+                              && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)
+                              && ctx->device->vendor_id != VK_VENDOR_ID_INTEL;
+    if (allow_f16acc) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
             return ctx->device->pipeline_matmul_f16_f32.f16acc;
         }
@@ -6113,7 +6118,10 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     if (ctx->device->coopmat_support) {
         return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
     }
-    return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+    // Intel Gen12 iGPUs: fp16 accumulation overflows at large K producing NaN.
+    const bool use_f16acc = ctx->device->fp16 && prec == GGML_PREC_DEFAULT
+                            && ctx->device->vendor_id != VK_VENDOR_ID_INTEL;
+    return use_f16acc ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
 
 static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
@@ -7426,7 +7434,17 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                               !ggml_vk_dim01_contiguous(src1);
 
     // If src0 is BF16, try to use a BF16 x BF16 multiply
-    ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    // Intel Gen12 iGPUs: dequantizing to fp16 can overflow (int8 * large scale > 65504)
+    // producing NaN that poisons the matmul. Use f32 intermediates on Intel.
+    ggml_type f16_type;
+    if (src0->type == GGML_TYPE_BF16) {
+        f16_type = GGML_TYPE_BF16;
+    } else if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && !ctx->device->coopmat_support
+               && ggml_is_quantized(src0->type)) {
+        f16_type = GGML_TYPE_F32;
+    } else {
+        f16_type = GGML_TYPE_F16;
+    }
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
@@ -8261,7 +8279,17 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                               !ggml_vk_dim01_contiguous(src1);
 
     // If src0 is BF16, try to use a BF16 x BF16 multiply
-    ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    // Intel Gen12 iGPUs: dequantizing to fp16 can overflow (int8 * large scale > 65504)
+    // producing NaN that poisons the matmul. Use f32 intermediates on Intel.
+    ggml_type f16_type;
+    if (src0->type == GGML_TYPE_BF16) {
+        f16_type = GGML_TYPE_BF16;
+    } else if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && !ctx->device->coopmat_support
+               && ggml_is_quantized(src0->type)) {
+        f16_type = GGML_TYPE_F32;
+    } else {
+        f16_type = GGML_TYPE_F16;
+    }
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
@@ -14367,7 +14395,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
     // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
+    // Intel ANV: pipeline barriers within a command buffer don't properly flush
+    // GPU caches between compute dispatches. Per-op submission forces full flush.
+    int nodes_per_submit = (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) ? 1 : 100;
     int submitted_nodes = 0;
     int submit_count = 0;
     uint64_t mul_mat_bytes = 0;
